@@ -595,44 +595,14 @@ export function completeSegment(containerID, placeholderID) {
   ) {
     return;
   }
-  // Every mutation below can synchronously run the connected and disconnected
-  // callbacks of custom elements in this content, and those are free to move or
-  // remove either node. The guard above therefore only describes the tree up to
-  // the first mutation, so each step re-establishes what it needs before it
-  // mutates anything else. Bailing out at any point leaves the fallback for the
-  // client to render, which is the degradation this has to have instead of a
-  // thrown DOMException, a half spliced boundary or content moved into a parent
-  // that no longer holds the placeholder.
-  const placeholderParent = placeholderNode.parentNode;
   segmentContainer.parentNode.removeChild(segmentContainer);
-  if (
-    placeholderNode.parentNode !== placeholderParent ||
-    segmentContainer.contains(placeholderNode)
-  ) {
-    return;
+  while (segmentContainer.firstChild) {
+    placeholderNode.parentNode.insertBefore(
+      segmentContainer.firstChild,
+      placeholderNode,
+    );
   }
-  // Gathering the children while they are detached runs no callback and visits
-  // each of them exactly once, so nothing can interleave with this walk or keep
-  // it going forever. A fragment then splices all of them in a single insertion
-  // that cannot be interrupted part of the way through.
-  const segmentFragment = document.createDocumentFragment();
-  let child = segmentContainer.firstChild;
-  while (child) {
-    const nextChild = child.nextSibling;
-    segmentFragment.appendChild(child);
-    child = nextChild;
-  }
-  if (
-    placeholderNode.parentNode !== placeholderParent ||
-    segmentFragment.contains(placeholderNode)
-  ) {
-    return;
-  }
-  placeholderParent.insertBefore(segmentFragment, placeholderNode);
-  // Connecting the content may have consumed or moved the placeholder already.
-  if (placeholderNode.parentNode) {
-    placeholderNode.parentNode.removeChild(placeholderNode);
-  }
+  placeholderNode.parentNode.removeChild(placeholderNode);
 }
 
 // This is the exact URL string we expect that Fizz renders if we provide a function action.
