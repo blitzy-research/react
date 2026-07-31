@@ -1341,6 +1341,14 @@ describe('ReactDOMFizzStaticBrowser', () => {
     expect(errors).toEqual(['This operation was aborted']);
   });
 
+  // React coordinates no numbering between independently created streams, so a
+  // page composed of two of them contains each identifier twice. The first
+  // document below parks two completed boundaries in the reveal batch, taking
+  // both S:0 and S:1, while the second document completes a partial segment
+  // under that same S:1. As long as the queued nodes stay discoverable by id the
+  // second document's segment instruction resolves S:1 to the first document's
+  // container - getElementById answers with the first match in tree order - and
+  // splices one application's content into the other's placeholder.
   it('composes two independently generated streams without cross-stream segment capture', async () => {
     const errors = [];
 
@@ -1348,30 +1356,63 @@ describe('ReactDOMFizzStaticBrowser', () => {
     const promiseFirst = new Promise(r => (resolveFirst = r));
     let resolveSecond;
     const promiseSecond = new Promise(r => (resolveSecond = r));
+    let resolveNested;
+    const promiseNested = new Promise(r => (resolveNested = r));
 
     // Padded past the 500 byte outlining threshold so that each boundary is
     // emitted into a hidden container and joins the reveal batch.
     const firstText = 'first-' + 'f'.repeat(600);
     const secondText = 'second-' + 's'.repeat(600);
+    const nestedText = 'nested-content';
 
-    function createApp(text, promise) {
-      async function Late() {
-        await promise;
-        return <div>{text}</div>;
-      }
-      return function App() {
-        return (
-          <div>
-            <Suspense fallback="pend">
-              <Late />
-            </Suspense>
-          </div>
-        );
-      };
+    async function First() {
+      await promiseFirst;
+      return <div>{firstText}</div>;
     }
 
-    const FirstApp = createApp(firstText, promiseFirst);
-    const SecondApp = createApp(secondText, promiseSecond);
+    async function Second() {
+      await promiseSecond;
+      return <div>{secondText}</div>;
+    }
+
+    // Two boundaries, so this document alone occupies both S:0 and S:1.
+    function FirstApp() {
+      return (
+        <div>
+          <Suspense fallback="pendFirst">
+            <First />
+          </Suspense>
+          <Suspense fallback="pendSecond">
+            <Second />
+          </Suspense>
+        </div>
+      );
+    }
+
+    async function Nested() {
+      await promiseNested;
+      return nestedText;
+    }
+
+    // A complete head and tail around a late suspension is what makes React
+    // emit a placeholder for a partial segment, and with it the segment
+    // completion instruction that consumes the colliding S:1.
+    function SecondApp() {
+      return (
+        <div>
+          <Suspense fallback="pendNested">
+            <div>
+              {'head'}
+              <b>
+                {'mid '}
+                <Nested />
+              </b>
+              {'tail'}
+            </div>
+          </Suspense>
+        </div>
+      );
+    }
 
     const firstStream = await serverAct(() =>
       ReactDOMFizzServer.renderToReadableStream(<FirstApp />, {
@@ -1381,6 +1422,14 @@ describe('ReactDOMFizzStaticBrowser', () => {
         },
       }),
     );
+
+    // The first document finishes rendering before anything is inserted, so it
+    // arrives complete the way a cached response would.
+    await serverAct(async () => {
+      resolveFirst();
+      resolveSecond();
+    });
+
     const secondStream = await serverAct(() =>
       ReactDOMFizzServer.renderToReadableStream(<SecondApp />, {
         progressiveChunkSize: 1,
@@ -1390,29 +1439,58 @@ describe('ReactDOMFizzStaticBrowser', () => {
       }),
     );
 
-    // Both renders are finished before anything is inserted, so the two
-    // documents arrive as a single burst the way a cached response would.
+    // The second document has to be read while its nested suspension is still
+    // outstanding, because a segment placeholder is only emitted if the
+    // boundary's content flushes before that segment completes. Reading it up
+    // front also keeps every serverAct call - each of which drains the fake
+    // timers, and with them the reveal batch - ahead of the first insertion.
+    const secondReading = readContent(secondStream);
     await serverAct(async () => {
-      resolveFirst();
-      resolveSecond();
+      resolveNested();
     });
+    const secondPayload = await secondReading;
 
     await readIntoContainerWithoutRevealing(firstStream);
 
-    // The first document's boundary is queued for the reveal, so the second
-    // document's instructions run while it is still parked.
-    expect(container.querySelectorAll('div[hidden]').length).toBe(1);
+    // Both of the first document's boundaries are queued for the reveal, so the
+    // second document's instructions run while they are still parked.
+    expect(container.querySelectorAll('div[hidden]').length).toBe(2);
 
-    await readIntoContainerWithoutRevealing(secondStream);
+    // The collision has to be armed for this test to prove anything: the first
+    // document hands S:1 to the reveal batch and the second document completes
+    // its own partial segment under that very identifier.
+    const firstInstructions = Array.from(container.querySelectorAll('script'))
+      .map(script => script.textContent)
+      .join('');
+    expect(firstInstructions).toContain('$RC("B:1","S:1")');
+    expect(secondPayload).toContain('$RS("S:1","P:1")');
+
+    // Insert the already read second document the way the non-draining helper
+    // does. A cached response arrives in one burst, so both documents' scripts
+    // run back to back without a timer in between.
+    const secondDocument = document.createElement('div');
+    secondDocument.innerHTML = secondPayload;
+    await insertNodesAndExecuteScripts(secondDocument, container, null);
 
     jest.runAllTimers();
 
+    // Each application has to reveal its own content. Capturing the first
+    // document's queued segment instead leaves its second boundary revealed
+    // empty and the second document's boundary pending forever.
     expect(getVisibleChildren(container)).toEqual([
       <div>
         <div>{firstText}</div>
+        <div>{secondText}</div>
       </div>,
       <div>
-        <div>{secondText}</div>
+        <div>
+          {'head'}
+          <b>
+            {'mid '}
+            {nestedText}
+          </b>
+          {'tail'}
+        </div>
       </div>,
     ]);
     expect(container.querySelectorAll('div[hidden]').length).toBe(0);
