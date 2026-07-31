@@ -98,10 +98,7 @@ describe('ReactDOMFizzStaticBrowser', () => {
   }
 
   // Same as readIntoContainer, but leaves the reveal batch pending so that a
-  // subsequent stream's instructions run inside the batch window. Draining the
-  // timers between two streams reveals the first stream's boundaries before the
-  // second stream's instructions execute, which hides any interaction between
-  // them.
+  // subsequent stream's instructions run inside the batch window.
   async function readIntoContainerWithoutRevealing(stream) {
     const reader = stream.getReader();
     let result = '';
@@ -1192,12 +1189,12 @@ describe('ReactDOMFizzStaticBrowser', () => {
     expect(getVisibleChildren(container)).toEqual(<div>Hi</div>);
   });
 
-  // Segment, placeholder and boundary ids are drawn from a counter that restarts
-  // at zero for every stream, so a page assembled from a prelude plus a resumed
-  // payload can contain the same id twice. While a completed boundary waits for
-  // the batched reveal it must not be discoverable under an id that the resumed
-  // stream is entitled to reuse, or the resumed stream's instruction consumes
-  // the shell's nodes and its own boundary is never revealed.
+  // The postponed state snapshots the segment id counter before the prelude is
+  // flushed, and flushing the prelude keeps allocating from that same counter,
+  // so a resumed stream can reuse an id whose shell boundary is still waiting
+  // in the reveal batch. This test verifies that the resumed stream's
+  // completion instruction cannot resolve that queued shell node; if it could,
+  // it would consume the shell's nodes and never reveal its own boundary.
   //
   // The apps below keep their shell deliberately tiny: with
   // progressiveChunkSize 1 anything larger trips React's unrelated advisory
@@ -1213,9 +1210,9 @@ describe('ReactDOMFizzStaticBrowser', () => {
     let resolveNested;
     const promiseNested = new Promise(r => (resolveNested = r));
 
-    // React only outlines a completed boundary into a hidden container once its
-    // content exceeds 500 bytes, and outlining is what puts the boundary into
-    // the reveal batch in the first place. Hence the padding.
+    // These boundaries have no preamble, so padding them past 500 bytes makes
+    // them eligible for the byte-size outlining path, and outlining into a
+    // hidden container is what puts a boundary into the reveal batch.
     const outlinedText = 'outlined-' + 'o'.repeat(600);
     const nestedText = 'nested-' + 'n'.repeat(600);
 
@@ -1319,12 +1316,11 @@ describe('ReactDOMFizzStaticBrowser', () => {
         </div>
       </div>,
     );
-    // Nothing may be left parked in a hidden container.
     expect(container.querySelectorAll('div[hidden]').length).toBe(0);
 
     // getVisibleChildren never returns comment nodes, so the boundary markers
-    // have to be inspected directly. A boundary left pending or queued after
-    // the reveal is one whose content was consumed by another stream.
+    // have to be inspected directly: no boundary may still be pending or
+    // queued once the reveal has run.
     const walker = container.ownerDocument.createTreeWalker(
       container,
       window.NodeFilter.SHOW_COMMENT,
@@ -1341,12 +1337,11 @@ describe('ReactDOMFizzStaticBrowser', () => {
     expect(errors).toEqual(['This operation was aborted']);
   });
 
-  // React coordinates no numbering between independently created streams, so a
-  // page composed of two of them contains each identifier twice. The first
-  // document below parks two completed boundaries in the reveal batch, taking
-  // both S:0 and S:1, while the second document completes a partial segment
-  // under that same S:1. As long as the queued nodes stay discoverable by id the
-  // second document's segment instruction resolves S:1 to the first document's
+  // React coordinates no numbering between independently created streams, so
+  // they can reuse each other's identifiers. The first document below parks two
+  // completed boundaries in the reveal batch, including the container emitted
+  // as S:1; the second document then runs its own $RS("S:1","P:1"). While a
+  // queued id stays discoverable that lookup lands on the first document's
   // container - getElementById answers with the first match in tree order - and
   // splices one application's content into the other's placeholder.
   it('composes two independently generated streams without cross-stream segment capture', async () => {
@@ -1359,7 +1354,8 @@ describe('ReactDOMFizzStaticBrowser', () => {
     let resolveNested;
     const promiseNested = new Promise(r => (resolveNested = r));
 
-    // Padded past the 500 byte outlining threshold so that each boundary is
+    // These boundaries have no preamble either, so padding them past 500
+    // bytes makes each one eligible for the byte-size outlining path: each is
     // emitted into a hidden container and joins the reveal batch.
     const firstText = 'first-' + 'f'.repeat(600);
     const secondText = 'second-' + 's'.repeat(600);
