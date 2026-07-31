@@ -421,6 +421,12 @@ export function completeBoundary(suspenseBoundaryID, contentID) {
   // at the end of document load.
   const suspenseNodeOuter = suspenseIdNodeOuter.previousSibling;
   suspenseNodeOuter.data = SUSPENSE_QUEUED_START_DATA;
+  // The batch now owns both nodes by reference and no instruction addresses
+  // them by id again. Pages composed from more than one independently
+  // generated stream reuse the same S:/B:/P: numbering, so leaving these ids
+  // in the document lets a later stream's getElementById resolve to these.
+  suspenseIdNodeOuter.removeAttribute('id');
+  contentNodeOuter.removeAttribute('id');
   // Queue this boundary for the next batch
   window['$RB'].push(suspenseIdNodeOuter, contentNodeOuter);
 
@@ -577,9 +583,18 @@ export function completeBoundaryWithStyles(
 export function completeSegment(containerID, placeholderID) {
   const segmentContainer = document.getElementById(containerID);
   const placeholderNode = document.getElementById(placeholderID);
-  // We always expect both nodes to exist here because, while we might
-  // have navigated away from the main tree, we still expect the detached
-  // tree to exist.
+  if (
+    !segmentContainer ||
+    !placeholderNode ||
+    !segmentContainer.parentNode ||
+    !placeholderNode.parentNode ||
+    // A cross-stream id collision can resolve the container to an ancestor of
+    // the placeholder. Splicing it in throws HierarchyRequestError and detaches
+    // live content, so bail out and leave the fallback for the client to render.
+    segmentContainer.contains(placeholderNode)
+  ) {
+    return;
+  }
   segmentContainer.parentNode.removeChild(segmentContainer);
   while (segmentContainer.firstChild) {
     placeholderNode.parentNode.insertBefore(
