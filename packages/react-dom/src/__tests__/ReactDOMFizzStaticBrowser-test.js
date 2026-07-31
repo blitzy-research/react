@@ -97,6 +97,26 @@ describe('ReactDOMFizzStaticBrowser', () => {
     jest.runAllTimers();
   }
 
+  // Same as readIntoContainer, but leaves the reveal batch pending so that a
+  // subsequent stream's instructions run inside the batch window. Draining the
+  // timers between two streams reveals the first stream's boundaries before the
+  // second stream's instructions execute, which hides any interaction between
+  // them.
+  async function readIntoContainerWithoutRevealing(stream) {
+    const reader = stream.getReader();
+    let result = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) {
+        break;
+      }
+      result += Buffer.from(value).toString('utf8');
+    }
+    const temp = document.createElement('div');
+    temp.innerHTML = result;
+    await insertNodesAndExecuteScripts(temp, container, null);
+  }
+
   async function readIntoNewDocument(stream) {
     const content = await readContent(stream);
     const jsdom = new JSDOM(
@@ -1170,5 +1190,338 @@ describe('ReactDOMFizzStaticBrowser', () => {
     await readIntoContainer(dynamic);
 
     expect(getVisibleChildren(container)).toEqual(<div>Hi</div>);
+  });
+
+  // Segment, placeholder and boundary ids are drawn from a counter that restarts
+  // at zero for every stream, so a page assembled from a prelude plus a resumed
+  // payload can contain the same id twice. While a completed boundary waits for
+  // the batched reveal it must not be discoverable under an id that the resumed
+  // stream is entitled to reuse, or the resumed stream's instruction consumes
+  // the shell's nodes and its own boundary is never revealed.
+  //
+  // The apps below keep their shell deliberately tiny: with
+  // progressiveChunkSize 1 anything larger trips React's unrelated advisory
+  // about a large render-blocking shell.
+  // @gate enableHalt
+  it("does not reveal a resumed boundary into the shell's queued segment", async () => {
+    const errors = [];
+
+    let resolveOutlined;
+    const promiseOutlined = new Promise(r => (resolveOutlined = r));
+    let resolveHalted;
+    const promiseHalted = new Promise(r => (resolveHalted = r));
+    let resolveNested;
+    const promiseNested = new Promise(r => (resolveNested = r));
+
+    // React only outlines a completed boundary into a hidden container once its
+    // content exceeds 500 bytes, and outlining is what puts the boundary into
+    // the reveal batch in the first place. Hence the padding.
+    const outlinedText = 'outlined-' + 'o'.repeat(600);
+    const nestedText = 'nested-' + 'n'.repeat(600);
+
+    async function Outlined() {
+      await promiseOutlined;
+      return <div>{outlinedText}</div>;
+    }
+
+    async function Nested() {
+      await promiseNested;
+      return <div>{nestedText}</div>;
+    }
+
+    async function Halted() {
+      await promiseHalted;
+      return (
+        <div>
+          {'halted-shell'}
+          <Suspense fallback="pendN">
+            <Nested />
+          </Suspense>
+        </div>
+      );
+    }
+
+    function App() {
+      return (
+        <div>
+          <Suspense fallback="pendA">
+            <Outlined />
+          </Suspense>
+          <Suspense fallback="pendB">
+            <Halted />
+          </Suspense>
+        </div>
+      );
+    }
+
+    const controller = new AbortController();
+    let pendingResult;
+    await serverAct(async () => {
+      pendingResult = ReactDOMFizzStatic.prerender(<App />, {
+        signal: controller.signal,
+        progressiveChunkSize: 1,
+        onError(x) {
+          errors.push(x.message);
+        },
+      });
+    });
+
+    // The first boundary resolves before the abort so that the prelude outlines
+    // it, while the second one is still pending and gets halted.
+    await serverAct(async () => {
+      resolveOutlined();
+    });
+
+    controller.abort();
+
+    const prerendered = await pendingResult;
+    expect(prerendered.postponed).not.toBe(null);
+    const postponedState = JSON.stringify(prerendered.postponed);
+
+    await serverAct(async () => {
+      resolveHalted();
+    });
+
+    const dynamic = await serverAct(() =>
+      ReactDOMFizzServer.resume(<App />, JSON.parse(postponedState), {
+        progressiveChunkSize: 1,
+        onError(x) {
+          errors.push(x.message);
+        },
+      }),
+    );
+
+    // The nested boundary resolves only once the resume has started, so the
+    // resumed payload carries its own completion instruction. Every promise is
+    // settled before the first insertion because serverAct flushes pending
+    // timers, which would reveal the batch early.
+    await serverAct(async () => {
+      resolveNested();
+    });
+
+    await readIntoContainerWithoutRevealing(prerendered.prelude);
+
+    // The prelude's outlined content is still parked in its hidden container,
+    // i.e. the reveal batch is genuinely pending. Without that the resumed
+    // stream's instructions would not run inside the window at all.
+    expect(container.querySelectorAll('div[hidden]').length).toBe(1);
+
+    await readIntoContainerWithoutRevealing(dynamic);
+
+    jest.runAllTimers();
+
+    expect(getVisibleChildren(container)).toEqual(
+      <div>
+        <div>{outlinedText}</div>
+        <div>
+          {'halted-shell'}
+          <div>{nestedText}</div>
+        </div>
+      </div>,
+    );
+    // Nothing may be left parked in a hidden container.
+    expect(container.querySelectorAll('div[hidden]').length).toBe(0);
+
+    // getVisibleChildren never returns comment nodes, so the boundary markers
+    // have to be inspected directly. A boundary left pending or queued after
+    // the reveal is one whose content was consumed by another stream.
+    const walker = container.ownerDocument.createTreeWalker(
+      container,
+      window.NodeFilter.SHOW_COMMENT,
+    );
+    const unrevealedBoundaries = [];
+    while (walker.nextNode()) {
+      const data = walker.currentNode.data;
+      if (data === '$?' || data === '$~') {
+        unrevealedBoundaries.push(data);
+      }
+    }
+    expect(unrevealedBoundaries).toEqual([]);
+
+    expect(errors).toEqual(['This operation was aborted']);
+  });
+
+  it('composes two independently generated streams without cross-stream segment capture', async () => {
+    const errors = [];
+
+    let resolveFirst;
+    const promiseFirst = new Promise(r => (resolveFirst = r));
+    let resolveSecond;
+    const promiseSecond = new Promise(r => (resolveSecond = r));
+
+    // Padded past the 500 byte outlining threshold so that each boundary is
+    // emitted into a hidden container and joins the reveal batch.
+    const firstText = 'first-' + 'f'.repeat(600);
+    const secondText = 'second-' + 's'.repeat(600);
+
+    function createApp(text, promise) {
+      async function Late() {
+        await promise;
+        return <div>{text}</div>;
+      }
+      return function App() {
+        return (
+          <div>
+            <Suspense fallback="pend">
+              <Late />
+            </Suspense>
+          </div>
+        );
+      };
+    }
+
+    const FirstApp = createApp(firstText, promiseFirst);
+    const SecondApp = createApp(secondText, promiseSecond);
+
+    const firstStream = await serverAct(() =>
+      ReactDOMFizzServer.renderToReadableStream(<FirstApp />, {
+        progressiveChunkSize: 1,
+        onError(x) {
+          errors.push(x.message);
+        },
+      }),
+    );
+    const secondStream = await serverAct(() =>
+      ReactDOMFizzServer.renderToReadableStream(<SecondApp />, {
+        progressiveChunkSize: 1,
+        onError(x) {
+          errors.push(x.message);
+        },
+      }),
+    );
+
+    // Both renders are finished before anything is inserted, so the two
+    // documents arrive as a single burst the way a cached response would.
+    await serverAct(async () => {
+      resolveFirst();
+      resolveSecond();
+    });
+
+    await readIntoContainerWithoutRevealing(firstStream);
+
+    // The first document's boundary is queued for the reveal, so the second
+    // document's instructions run while it is still parked.
+    expect(container.querySelectorAll('div[hidden]').length).toBe(1);
+
+    await readIntoContainerWithoutRevealing(secondStream);
+
+    jest.runAllTimers();
+
+    expect(getVisibleChildren(container)).toEqual([
+      <div>
+        <div>{firstText}</div>
+      </div>,
+      <div>
+        <div>{secondText}</div>
+      </div>,
+    ]);
+    expect(container.querySelectorAll('div[hidden]').length).toBe(0);
+
+    const walker = container.ownerDocument.createTreeWalker(
+      container,
+      window.NodeFilter.SHOW_COMMENT,
+    );
+    const unrevealedBoundaries = [];
+    while (walker.nextNode()) {
+      const data = walker.currentNode.data;
+      if (data === '$?' || data === '$~') {
+        unrevealedBoundaries.push(data);
+      }
+    }
+    expect(unrevealedBoundaries).toEqual([]);
+
+    expect(errors).toEqual([]);
+  });
+
+  it('completeSegment ignores a container that contains its placeholder', async () => {
+    const errors = [];
+
+    let resolveLate;
+    const promiseLate = new Promise(r => (resolveLate = r));
+
+    async function Late() {
+      await promiseLate;
+      return 'late-content';
+    }
+
+    // Suspending below an otherwise complete boundary is what makes React emit
+    // a placeholder for a partial segment, and with it the segment completion
+    // instruction whose shipped implementation this test exercises.
+    function App() {
+      return (
+        <div>
+          <Suspense fallback="pend">
+            <div>
+              {'head'}
+              <b>
+                {'mid '}
+                <Late />
+              </b>
+              {'tail'}
+            </div>
+          </Suspense>
+        </div>
+      );
+    }
+
+    const stream = await serverAct(() =>
+      ReactDOMFizzServer.renderToReadableStream(<App />, {
+        onError(x) {
+          errors.push(x.message);
+        },
+      }),
+    );
+
+    // Resolve while the read is in flight so that the shell is flushed with the
+    // segment still outstanding. Resolving beforehand would render the whole
+    // tree in one piece and no segment instruction would be emitted.
+    const reading = readIntoContainerWithoutRevealing(stream);
+    await serverAct(async () => {
+      resolveLate();
+    });
+    await reading;
+
+    jest.runAllTimers();
+
+    expect(getVisibleChildren(container)).toEqual(
+      <div>
+        <div>
+          {'head'}
+          <b>
+            {'mid '}
+            {'late-content'}
+          </b>
+          {'tail'}
+        </div>
+      </div>,
+    );
+
+    // Read the instruction back off the window so that the assertion below
+    // covers the implementation the server actually shipped.
+    expect(typeof window.$RS).toBe('function');
+
+    // A cross-stream id collision can hand the instruction a container that is
+    // an ancestor of the placeholder it is supposed to splice into. Splicing
+    // that in would throw and detach live content, so it has to be ignored and
+    // the boundary left for the client to render.
+    const segmentContainer = document.createElement('div');
+    segmentContainer.hidden = true;
+    segmentContainer.id = 'S:9';
+    const nested = document.createElement('div');
+    const placeholderNode = document.createElement('template');
+    placeholderNode.id = 'P:9';
+    nested.appendChild(placeholderNode);
+    segmentContainer.appendChild(nested);
+    container.appendChild(segmentContainer);
+
+    const treeBefore = container.innerHTML;
+    // The arguments are the container id first, then the placeholder id, which
+    // is the order the server emits them in.
+    expect(() => window.$RS('S:9', 'P:9')).not.toThrow();
+    expect(container.innerHTML).toBe(treeBefore);
+    expect(placeholderNode.parentNode).toBe(nested);
+    expect(segmentContainer.parentNode).toBe(container);
+
+    expect(errors).toEqual([]);
   });
 });
